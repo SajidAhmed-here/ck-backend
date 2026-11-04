@@ -1,77 +1,217 @@
-name: clearkeep-test
+name: ClearKeep production
 
 on:
   push:
-    branches: [ production ]
-#  pull_request:
-#    branches: [ development ]
-#   schedule:
-#     - cron: '0 12 * * *'
+    branches: [production]
+  pull_request:
+    branches: [production]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never interrupt a deployment while it is installing packages or restarting services.
+concurrency:
+  group: production-${{ github.event_name == 'pull_request' && github.ref || 'deploy' }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  deploy-test:
-    runs-on: ubuntu-latest
-    # strategy:
-    #   matrix:
-    #     python-version: [3.8]
-
+  validate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    # Matches Pipfile and the existing Dockerfile; modern Python breaks these pins.
+    container: python:3.8.20-bullseye
     steps:
-    # - uses: actions/checkout@v2
-    # - name: Set up Python ${{ matrix.python-version }}
-    #   uses: actions/setup-python@v2
-    #   with:
-    #     python-version: ${{ matrix.python-version }}
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-    #   # Install dependencies
-    # - name: Install dependencies
-    #   run: |
-    #     python -m pip install --upgrade pip
-    #     if [ -f requirement.txt ]; then pip install -r requirement.txt; fi
+      - name: Install native build and runtime dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential libffi-dev libpq-dev libmagic1
 
-      # Build and gen api document
-    # - name: Build
-    #   run: npm run build:staging
+      - name: Install and verify the existing Python requirements
+        run: |
+          # Legacy source packages need setuptools before removal of use_2to3.
+          python -m pip install 'pip==24.3.1' 'setuptools==57.5.0' 'wheel==0.45.1'
+          python -m pip install --no-build-isolation -r requirement.txt
+          python -m pip check
 
-    # - name: Login to Docker Hub
-    #   uses: docker/login-action@v1
-    #   with:
-    #     username: ${{ secrets.DOCKER_HUB_USERNAME }}
-    #     password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+      - name: Check Python syntax and regenerate protobufs
+        run: |
+          python -m compileall -q app_grpc.py app_http.py cron_tab.py src utils middlewares client msg
+          python -m grpc_tools.protoc -I=. protos/*.proto --python_out=. --grpc_python_out=.
+          python -m compileall -q protos
+          python - <<'PY'
+          import importlib
+          from pathlib import Path
+          for path in Path('protos').glob('*_pb2*.py'):
+              importlib.import_module('protos.' + path.stem)
+          PY
 
-    # - name: Set up Docker Buildx
-    #   id: buildx
-    #   uses: docker/setup-buildx-action@v1
+  deploy:
+    needs: validate
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/production'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    environment: production
+    env:
+      # Existing repository secret names are retained. Set these in the production
+      # GitHub environment, or as repository secrets if no environment overrides exist.
+      SSH_HOST: ${{ secrets.HOST }}
+      SSH_USER: ${{ secrets.USERNAME }}
+      SSH_KEY: ${{ secrets.KEY }}
+      # Trusted OpenSSH known_hosts entry, obtained from the server administrator.
+      # Do not populate this by trusting an unverified ssh-keyscan during a run.
+      SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+      SSH_PORT: ${{ vars.PRODUCTION_SSH_PORT || '22' }}
+      DEPLOY_SHA: ${{ github.sha }}
+    steps:
+      - name: Validate SSH settings
+        run: |
+          for variable in SSH_HOST SSH_USER SSH_KEY SSH_KNOWN_HOSTS; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Required production SSH setting is missing: $variable"
+              exit 1
+            fi
+          done
+          [[ "$SSH_HOST" =~ ^[a-zA-Z0-9][a-zA-Z0-9.:-]*$ ]]
+          [[ "$SSH_USER" =~ ^[a-zA-Z_][a-zA-Z0-9_-]*$ ]]
+          [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]]
+          (( 10#$SSH_PORT >= 1 && 10#$SSH_PORT <= 65535 ))
+          [[ "$DEPLOY_SHA" =~ ^[a-f0-9]{40}$ ]]
 
-    # - name: Build and push
-    #   id: docker_build
-    #   uses: docker/build-push-action@v2
-    #   with:
-    #     context: .
-    #     file: ./docker/staging.dockerfile
-    #     push: true
-    #     tags: duonghx98/demo-app:latest
+      - name: Deploy the validated production commit
+        run: |
+          set -euo pipefail
+          ssh_directory=$(mktemp -d)
+          trap 'rm -rf "$ssh_directory"' EXIT
+          chmod 700 "$ssh_directory"
+          printf '%s\n' "$SSH_KEY" > "$ssh_directory/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$ssh_directory/known_hosts"
+          chmod 600 "$ssh_directory/key" "$ssh_directory/known_hosts"
 
-    # - name: Image digest
-    #   run: echo ${{ steps.docker_build.outputs.digest }}
-
-    - name: Run app
-      uses: JimCronqvist/action-ssh@master
-      with:
-        hosts: ${{ secrets.USERNAME }}@${{ secrets.HOST }}
-        privateKey: ${{ secrets.KEY }}
-        command: |
+          ssh -T -i "$ssh_directory/key" -p "$SSH_PORT" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="$ssh_directory/known_hosts" \
+            -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
+            "$SSH_USER@$SSH_HOST" "bash -se -- '$DEPLOY_SHA'" <<'REMOTE'
+          set -euo pipefail
+          export ENV=production
+          export PIP_DISABLE_PIP_VERSION_CHECK=1
+          deploy_sha=$1
           cd /home/ubuntu/prod-clk328/ck-backend
-          git checkout production
-          git reset --hard HEAD
-          git pull
-          pip3 install -r requirement.txt
-          python3 -m grpc_tools.protoc -I=. protos/*.proto --python_out=. --grpc_python_out=.
-          sudo systemctl restart prod-http-clk328.service
-          sleep 10
-          sudo systemctl restart prod-grpc-clk328.service
-          sleep 20
-          python3 cron_tab.py
-          sleep 20
-          sudo systemctl restart dev-http-clk328.service
-          sudo systemctl restart stagging-http-clk328.service
-        #  docker restart clearkeep
-        # ./restart-service.sh
+
+          # Server prerequisites are provisioned separately. Both systemd units
+          # must use /usr/bin/python3 and ENV=production, with this working directory.
+          # Keep configs/, certificates, external services and database data in place.
+          /usr/bin/python3 -c 'import sys; assert sys.version_info[:2] == (3, 8), "Production requires Python 3.8"'
+          command -v git
+          command -v gcc
+          /usr/bin/python3 -c 'import ctypes; ctypes.CDLL("libmagic.so.1")'
+          systemctl cat prod-http-clk328.service >/dev/null
+          systemctl cat prod-grpc-clk328.service >/dev/null
+          /usr/bin/python3 - <<'PY'
+          import json
+          from pathlib import Path
+          with Path('configs/production.json').open() as stream:
+              config = json.load(stream)
+          required = {
+              'db': ('username', 'password', 'host', 'port', 'name'),
+              'keycloak_admin': ('server_url', 'client_id', 'username', 'password', 'realm_name', 'client_secret_key'),
+              'keycloak_account': ('server_url', 'client_id', 'realm_name', 'client_secret_key'),
+              'otp_server': ('twilio_account_sid', 'twilio_auth_token', 'otp_life_time', 'otp_code_length', 'otp_server_phone_number', 'otp_secret_key', 'input_otp_per_validate', 'request_otp_server_per_day'),
+              'janus_webrtc': ('admin_url', 'client_url', 'client_ws_url', 'admin_secret'),
+              'storage_s3': ('folder', 'access_key_id', 'access_key_secret', 'bucket', 'url'),
+              'smtp_server': ('SMTP_HOST', 'SMTP_PORT', 'SMTP_SENDER', 'SMTP_USERNAME', 'SMTP_PASSWORD', 'SSL'),
+              'stun_turn_credential': ('coturn_user', 'coturn_password'),
+          }
+          missing = []
+          for key in ('grpc_port', 'http_port', 'server_domain', 'server_name', 'fd_server',
+                      'deeplink_scheme', 'stun_turn_port', 'google_app_id', 'facebook_app',
+                      'maximum_offline_time_limit'):
+              if key not in config:
+                  missing.append(key)
+          for section, keys in required.items():
+              for key in keys:
+                  if not isinstance(config.get(section), dict) or key not in config[section]:
+                      missing.append(section + '.' + key)
+          apple = config.get('apple_authen', {})
+          if not isinstance(apple, dict) or 'audience' not in apple.get('default', {}):
+              missing.append('apple_authen.default.audience')
+          notification = config.get('notification', {})
+          for platform, keys in {
+              'android': ('fire_base_config',),
+              'ios': ('bundle_id', 'certificates_apns', 'certificates_voip', 'use_sandbox'),
+          }.items():
+              profiles = notification.get(platform, {})
+              if not isinstance(profiles, dict) or 'default' not in profiles:
+                  missing.append('notification.' + platform + '.default')
+                  continue
+              for name, profile in profiles.items():
+                  for key in keys:
+                      if key not in profile:
+                          missing.append('notification.' + platform + '.' + name + '.' + key)
+                  for key in ('certificates_apns', 'certificates_voip', 'fire_base_config'):
+                      value = profile.get(key)
+                      if isinstance(value, str) and not Path(value).is_file():
+                          missing.append('notification.' + platform + '.' + name + '.' + key + ' (file)')
+          if not isinstance(config.get('fd_server'), list) or not config['fd_server']:
+              missing.append('fd_server (nonempty list)')
+          else:
+              for server in config['fd_server']:
+                  for key in ('domain', 'ip_address'):
+                      if key not in server:
+                          missing.append('fd_server[].' + key)
+          if missing:
+              raise SystemExit('Missing production config keys: ' + ', '.join(missing))
+          for key in ('grpc_port', 'http_port'):
+              if not 1 <= int(config[key]) <= 65535:
+                  raise SystemExit('Invalid production port: ' + key)
+          PY
+
+          git fetch --no-tags origin production
+          if [[ "$(git rev-parse FETCH_HEAD)" != "$deploy_sha" ]]; then
+            echo 'Production has advanced; refusing to deploy an outdated commit.' >&2
+            exit 1
+          fi
+          # As in the original deploy, this is a managed checkout: tracked files
+          # are replaced by the production commit. Ignored configs are preserved.
+          git checkout -f -B production "$deploy_sha"
+          /usr/bin/python3 -m pip install 'pip==24.3.1' 'setuptools==57.5.0' 'wheel==0.45.1'
+          /usr/bin/python3 -m pip install --no-build-isolation -r requirement.txt
+          /usr/bin/python3 -m pip check
+          /usr/bin/python3 -m grpc_tools.protoc -I=. protos/*.proto --python_out=. --grpc_python_out=.
+
+          sudo -n systemctl restart prod-http-clk328.service
+          sudo -n systemctl restart prod-grpc-clk328.service
+          /usr/bin/python3 - <<'PY'
+          import json
+          import time
+          import urllib.request
+          import grpc
+          with open('configs/production.json') as stream:
+              config = json.load(stream)
+          deadline = time.monotonic() + 90
+          with grpc.insecure_channel('127.0.0.1:' + str(config['grpc_port'])) as channel:
+              grpc.channel_ready_future(channel).result(timeout=90)
+          url = 'http://127.0.0.1:{}/thread'.format(config['http_port'])
+          while True:
+              try:
+                  with urllib.request.urlopen(url, timeout=5) as response:
+                      if response.status != 200 or 'total' not in json.load(response):
+                          raise ValueError('Unexpected HTTP readiness response')
+                  break
+              except Exception:
+                  if time.monotonic() >= deadline:
+                      raise SystemExit('Production HTTP readiness check failed')
+                  time.sleep(3)
+          PY
+          sudo -n systemctl is-active --quiet prod-http-clk328.service
+          sudo -n systemctl is-active --quiet prod-grpc-clk328.service
+          # cron_tab.py removes every ubuntu cron job and updates dev/staging too.
+          # Existing TURN refresh scheduling is managed separately from deployment.
+          REMOTE
