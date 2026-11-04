@@ -2,7 +2,7 @@ name: ClearKeep production
 
 on:
   push:
-    branches: [production]
+    branches: [production, master]
   pull_request:
     branches: [production]
   workflow_dispatch:
